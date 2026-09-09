@@ -28,6 +28,17 @@ const CONTACT = {
   phone: '+15551234567',
 }
 
+const CONFIG_ROW = {
+  id: 'cfg-1',
+  account_id: 'acct-1',
+  user_id: 'user-1',
+  phone_number_id: 'PNID-1',
+  access_token: 'enc-token',
+  branch_id: null as string | null,
+}
+
+let whatsappConfigs: typeof CONFIG_ROW[] = [CONFIG_ROW]
+
 // Chainable Supabase mock. A fresh builder per `.from()` call tracks whether
 // `.insert()` ran so the terminal resolves to the inserted row for creates
 // and the canned select row otherwise.
@@ -52,12 +63,7 @@ function makeSupabaseMock() {
           return { data: createdConversation ?? existingConversation, error: null }
         case 'whatsapp_config':
           return {
-            data: {
-              id: 'cfg-1',
-              account_id: 'acct-1',
-              phone_number_id: 'PNID-1',
-              access_token: 'enc-token',
-            },
+            data: whatsappConfigs[0] ?? null,
             error: null,
           }
         case 'message_templates':
@@ -75,6 +81,7 @@ function makeSupabaseMock() {
               id: 'conv-new',
               account_id: 'acct-1',
               contact_id: 'contact-1',
+              whatsapp_config_id: 'cfg-1',
               contact: CONTACT,
             },
             error: null,
@@ -91,9 +98,25 @@ function makeSupabaseMock() {
 
     const b: Record<string, unknown> = {}
     const chain = () => b
-    for (const m of ['select', 'eq', 'in', 'order', 'limit', 'update', 'delete']) {
+    for (const m of ['select', 'eq', 'in', 'update', 'delete']) {
       b[m] = vi.fn(chain)
     }
+    b.order = vi.fn(() => {
+      if (table === 'whatsapp_config') {
+        return Promise.resolve({ data: whatsappConfigs, error: null })
+      }
+      return b
+    })
+    b.limit = vi.fn(() => {
+      if (table === 'conversations' && !didInsert) {
+        const row = createdConversation ?? existingConversation
+        return Promise.resolve({ data: row ? [row] : [], error: null })
+      }
+      if (table === 'whatsapp_config') {
+        return Promise.resolve({ data: whatsappConfigs, error: null })
+      }
+      return Promise.resolve({ data: [], error: null })
+    })
     b.insert = vi.fn((payload: Record<string, unknown>) => {
       didInsert = true
       if (table === 'conversations') {
@@ -102,6 +125,7 @@ function makeSupabaseMock() {
           id: 'conv-new',
           account_id: 'acct-1',
           contact_id: 'contact-1',
+          whatsapp_config_id: 'cfg-1',
           contact: CONTACT,
         }
       }
@@ -188,6 +212,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
     createdConversation = null
     contactRow = CONTACT
     callerRole = 'admin'
+    whatsappConfigs = [CONFIG_ROW]
     supabaseMock = makeSupabaseMock()
     sendTemplateMessage.mockClear()
   })
@@ -209,6 +234,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
     expect(conversationInserts[0]).toMatchObject({
       account_id: 'acct-1',
       contact_id: 'contact-1',
+      whatsapp_config_id: 'cfg-1',
     })
 
     // The template was sent to the contact's number.
@@ -228,6 +254,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
       content_type: 'template',
       template_name: 'order_update',
       sender_type: 'agent',
+      sender_id: 'user-1',
     })
   })
 
@@ -236,6 +263,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
       id: 'conv-existing',
       account_id: 'acct-1',
       contact_id: 'contact-1',
+      whatsapp_config_id: 'cfg-1',
       contact: CONTACT,
     }
 
@@ -277,11 +305,13 @@ describe('POST /api/whatsapp/send — role enforcement', () => {
       id: 'conv-existing',
       account_id: 'acct-1',
       contact_id: 'contact-1',
+      whatsapp_config_id: 'cfg-1',
       contact: CONTACT,
     }
     createdConversation = null
     contactRow = CONTACT
     callerRole = 'admin'
+    whatsappConfigs = [CONFIG_ROW]
     supabaseMock = makeSupabaseMock()
     sendTemplateMessage.mockClear()
   })
@@ -312,5 +342,20 @@ describe('POST /api/whatsapp/send — role enforcement', () => {
 
     expect(res.status).toBe(200)
     expect(sendTemplateMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('400s on contact send when two numbers exist and none is named', async () => {
+    existingConversation = null
+    whatsappConfigs = [
+      CONFIG_ROW,
+      { ...CONFIG_ROW, id: 'cfg-2', phone_number_id: 'PNID-2' },
+    ]
+
+    const res = await postContactTemplate()
+    const json = await res.json()
+
+    expect(res.status).toBe(400)
+    expect(json.error).toMatch(/whatsapp_config_id is required/i)
+    expect(sendTemplateMessage).not.toHaveBeenCalled()
   })
 })

@@ -98,6 +98,10 @@ export function canViewOnly(role: AccountRole): boolean {
   return role === "viewer";
 }
 
+export function canViewAllBranches(role: AccountRole): boolean {
+  return hasMinRole(role, "admin");
+}
+
 /** Owner only: irreversible destructive operations. */
 export function canDeleteAccount(role: AccountRole): boolean {
   return role === "owner";

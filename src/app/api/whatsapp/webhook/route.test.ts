@@ -14,6 +14,19 @@ const h = vi.hoisted(() => ({
     /** Row `lookupInternalIdByMetaId` resolves for a `context.id`. */
     replyContextParent: null as { id: string } | null,
     conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' },
+    configs: null as Array<{
+      id: string
+      account_id: string
+      user_id: string
+      access_token: string
+      phone_number_id: string
+      branch_id: string | null
+    }> | null,
+    conversationsByConfigId: {} as Record<
+      string,
+      { id: string; unread_count: number; account_id: string }
+    >,
+    conversationLookups: [] as Record<string, string>[],
     upsertCalls: [] as { row: Record<string, unknown>; options: unknown }[],
     rpcCalls: [] as { name: string; args: Record<string, unknown> }[],
     afterCallbacks: [] as (() => Promise<void> | void)[],
@@ -48,36 +61,57 @@ vi.mock('@supabase/supabase-js', () => ({
         case 'whatsapp_config':
           return {
             select: () => ({
-              eq: () =>
-                Promise.resolve({
-                  data: [
-                    {
-                      account_id: 'acc-1',
-                      user_id: 'user-1',
-                      access_token: 'enc',
-                      mirror_inbound_media: h.state.mirrorInboundMedia,
-                    },
-                  ],
+              eq: (_col: string, phoneNumberId: string) => {
+                const defaults = [
+                  {
+                    id: 'cfg-1',
+                    account_id: 'acc-1',
+                    user_id: 'user-1',
+                    access_token: 'enc',
+                    phone_number_id: 'pn-1',
+                    branch_id: null,
+                  },
+                ]
+                const rows = (h.state.configs ?? defaults).filter(
+                  (c) => c.phone_number_id === phoneNumberId,
+                )
+                return Promise.resolve({
+                  data: rows.map((c) => ({
+                    ...c,
+                    mirror_inbound_media: h.state.mirrorInboundMedia,
+                  })),
                   error: null,
-                }),
+                })
+              },
             }),
           }
         case 'conversations':
-          // findOrCreateConversation: select().eq().eq().order().limit()
+          // findOrCreateConversationForConfig:
+          // select().eq(account).eq(whatsapp_config_id).eq(contact).order().limit()
           return {
-            select: () => ({
-              eq: () => ({
-                eq: () => ({
-                  order: () => ({
-                    limit: () =>
-                      Promise.resolve({
-                        data: [h.state.conversation],
-                        error: null,
-                      }),
-                  }),
+            select: () => {
+              const filters: Record<string, string> = {}
+              const chain = {
+                eq: (col: string, val: string) => {
+                  filters[col] = val
+                  return chain
+                },
+                order: () => ({
+                  limit: () => {
+                    h.state.conversationLookups.push({ ...filters })
+                    const cfgId = filters.whatsapp_config_id
+                    const conv =
+                      (cfgId && h.state.conversationsByConfigId[cfgId]) ||
+                      h.state.conversation
+                    return Promise.resolve({
+                      data: [conv],
+                      error: null,
+                    })
+                  },
                 }),
-              }),
-            }),
+              }
+              return chain
+            },
           }
         case 'broadcast_recipients':
           // flagBroadcastReplyIfAny: select().eq().eq().in().order().limit()
@@ -216,7 +250,10 @@ const TEXT_MESSAGE = {
   text: { body: 'hello' },
 }
 
-function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
+function inboundRequest(
+  message: Record<string, unknown> = TEXT_MESSAGE,
+  phoneNumberId = 'pn-1',
+) {
   const body = {
     entry: [
       {
@@ -224,7 +261,7 @@ function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
           {
             field: 'messages',
             value: {
-              metadata: { phone_number_id: 'pn-1' },
+              metadata: { phone_number_id: phoneNumberId },
               contacts: [{ wa_id: '15551230000', profile: { name: 'Ada' } }],
               messages: [message],
             },
@@ -239,8 +276,12 @@ function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
   } as unknown as Request
 }
 
-async function runWebhook(message?: Record<string, unknown>) {
-  const res = await POST(inboundRequest(message))
+async function runWebhook(
+  message?: Record<string, unknown>,
+  phoneNumberId?: string,
+) {
+  h.state.afterCallbacks = []
+  const res = await POST(inboundRequest(message, phoneNumberId))
   // Drain the after() callback exactly as the runtime would.
   for (const cb of h.state.afterCallbacks) await cb()
   return res
@@ -252,6 +293,9 @@ beforeEach(() => {
   h.state.priorCustomerMsgCount = 0
   h.state.replyContextParent = null
   h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
+  h.state.configs = null
+  h.state.conversationsByConfigId = {}
+  h.state.conversationLookups = []
   h.state.upsertCalls = []
   h.state.rpcCalls = []
   h.state.afterCallbacks = []
@@ -323,7 +367,10 @@ describe('inbound webhook: atomic unread bump (#369)', () => {
     expect(h.state.rpcCalls).toHaveLength(1)
     expect(h.state.rpcCalls[0]).toMatchObject({
       name: 'bump_conversation_on_inbound',
-      args: { p_conversation_id: 'conv-1' },
+      args: {
+        p_conversation_id: 'conv-1',
+        p_inbound_at: new Date(1700000000 * 1000).toISOString(),
+      },
     })
   })
 })
@@ -536,5 +583,56 @@ describe('inbound webhook: after() awaits automations (#368)', () => {
     // If the dispatches were fire-and-forget, completed would still be 0
     // here — the callback would have resolved before the timers fired.
     expect(h.state.automationCompleted).toBe(3)
+  })
+})
+
+describe('inbound webhook: multi-number routing', () => {
+  it('opens a separate conversation per WhatsApp number for the same contact', async () => {
+    h.state.configs = [
+      {
+        id: 'cfg-a',
+        account_id: 'acc-1',
+        user_id: 'user-1',
+        access_token: 'enc',
+        phone_number_id: 'pn-a',
+        branch_id: 'br-a',
+      },
+      {
+        id: 'cfg-b',
+        account_id: 'acc-1',
+        user_id: 'user-1',
+        access_token: 'enc',
+        phone_number_id: 'pn-b',
+        branch_id: 'br-b',
+      },
+    ]
+    h.state.conversationsByConfigId = {
+      'cfg-a': { id: 'conv-a', unread_count: 0, account_id: 'acc-1' },
+      'cfg-b': { id: 'conv-b', unread_count: 0, account_id: 'acc-1' },
+    }
+
+    await runWebhook(TEXT_MESSAGE, 'pn-a')
+    await runWebhook(TEXT_MESSAGE, 'pn-b')
+
+    expect(h.state.conversationLookups).toEqual([
+      {
+        account_id: 'acc-1',
+        whatsapp_config_id: 'cfg-a',
+        contact_id: 'contact-1',
+      },
+      {
+        account_id: 'acc-1',
+        whatsapp_config_id: 'cfg-b',
+        contact_id: 'contact-1',
+      },
+    ])
+    expect(h.state.rpcCalls.map((c) => c.args.p_conversation_id)).toEqual([
+      'conv-a',
+      'conv-b',
+    ])
+    expect(h.state.upsertCalls.map((c) => c.row.conversation_id)).toEqual([
+      'conv-a',
+      'conv-b',
+    ])
   })
 })

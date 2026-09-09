@@ -36,6 +36,7 @@ import {
 } from '@/lib/whatsapp/interactive';
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
+import { loadWhatsAppConfigById } from '@/lib/whatsapp/load-config';
 import {
   sanitizePhoneForMeta,
   isValidE164,
@@ -88,6 +89,12 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * Dashboard agent who is sending. When set, persisted as
+   * `messages.sender_id` and closes the conversation waiting state.
+   * Leave unset for the public API (not a human agent).
+   */
+  agentUserId?: string | null;
 }
 
 export interface SendMessageResult {
@@ -201,6 +208,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    agentUserId,
   } = params;
 
   if (!conversationId) {
@@ -251,14 +259,17 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
+  const configId = conversation.whatsapp_config_id as string | undefined;
+  if (!configId) {
+    throw new SendMessageError(
+      'whatsapp_not_configured',
+      'Conversation is missing a WhatsApp number. Re-open the thread after connecting WhatsApp.',
+      400
+    );
+  }
 
-  if (configError || !config) {
+  const config = await loadWhatsAppConfigById(db, accountId, configId);
+  if (!config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -473,6 +484,7 @@ export async function sendMessageToConversation(
     .insert({
       conversation_id: conversationId,
       sender_type: 'agent',
+      sender_id: agentUserId || null,
       content_type: messageType,
       content_text: persistedText,
       media_url: mediaUrl || null,
@@ -500,17 +512,29 @@ export async function sendMessageToConversation(
       ? interactivePayloadPreviewText(interactivePayload!)
       : persistedText || `[${messageType}]`;
 
+  const nowIso = new Date().toISOString();
+  const conversationPatch: Record<string, unknown> = {
+    last_message_text: lastMessageText,
+    last_message_at: nowIso,
+    updated_at: nowIso,
+  };
+  // Only a logged-in dashboard agent closes the wait. Bot / public-API
+  // sends keep awaiting_response_since so KPI later attributes the
+  // human reply, not the automation.
+  if (agentUserId) {
+    conversationPatch.last_human_reply_at = nowIso;
+    conversationPatch.awaiting_response_since = null;
+  }
+
   await db
     .from('conversations')
-    .update({
-      last_message_text: lastMessageText,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
+    .update(conversationPatch)
     .eq('id', conversationId);
 
-  // Pause any active Flow run for this contact — the agent stepping in
-  // is the strongest "yield, human is here" signal. Best-effort.
+  // Pause any active Flow run for THIS conversation — the agent
+  // stepping in is the strongest "yield, human is here" signal.
+  // Scoped to conversation_id so a reply on number A does not pause
+  // a run that belongs to the same contact on number B.
   try {
     const { error: pauseErr } = await supabaseAdmin()
       .from('flow_runs')
@@ -520,7 +544,7 @@ export async function sendMessageToConversation(
         end_reason: 'agent_replied',
       })
       .eq('account_id', accountId)
-      .eq('contact_id', contact.id)
+      .eq('conversation_id', conversationId)
       .eq('status', 'active');
     if (pauseErr) {
       console.error('[flows] pause-on-agent-send failed:', pauseErr.message);

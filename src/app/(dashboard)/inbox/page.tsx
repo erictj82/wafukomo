@@ -183,12 +183,10 @@ function InboxPageInner() {
 
       if (!user) return;
 
-      // whatsapp_config is one-row-per-account post-multi-user, so
-      // the previous `.eq('user_id', user.id)` would miss the row
-      // for any teammate who didn't personally save the config —
-      // the "WhatsApp not connected" banner would show in the
-      // shared inbox even though the admin had it configured.
-      // Resolve account_id via the profile and query by that.
+      // Resolve account_id via the profile and query by that. Do not
+      // use `.maybeSingle()` — two numbers would throw PGRST116 and
+      // hide the banner incorrectly. Any connected number the caller
+      // can see (RLS) counts as connected.
       const { data: profile } = await supabase
         .from("profiles")
         .select("account_id")
@@ -203,10 +201,10 @@ function InboxPageInner() {
       const { data } = await supabase
         .from("whatsapp_config")
         .select("status")
-        .eq("account_id", accountId)
-        .maybeSingle();
+        .eq("account_id", accountId);
 
-      setWhatsappConnected(data?.status === "connected");
+      const rows = data ?? [];
+      setWhatsappConnected(rows.some((c: { status?: string }) => c.status === "connected"));
     };
 
     checkConnection();

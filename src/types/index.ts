@@ -181,6 +181,19 @@ export interface Conversation {
   ai_autoreply_disabled?: boolean;
   ai_reply_count?: number;
   ai_handoff_summary?: string | null;
+  /** WhatsApp number this thread belongs to (migration 040). */
+  whatsapp_config_id?: string;
+  /** Denormalised from that number. Null = unassigned. */
+  branch_id?: string | null;
+  /** Open waiting period; null once a human has replied (040 / 041). */
+  awaiting_response_since?: string | null;
+  /** Embedded in inbox selects for badges / filters. */
+  whatsapp_config?: {
+    id: string;
+    display_name?: string | null;
+    display_phone_number?: string | null;
+  } | null;
+  branch?: { id: string; name: string } | null;
 }
 
 // ============================================================
@@ -298,6 +311,12 @@ export interface WhatsAppConfig {
    * inbound attachments expire. Migration 039.
    */
   mirror_inbound_media?: boolean;
+  /** Org unit this number belongs to. Null = unassigned. */
+  branch_id?: string | null;
+  /** Operator-facing label (salon name). */
+  display_name?: string | null;
+  /** Human-readable MSISDN from Meta metadata. */
+  display_phone_number?: string | null;
 }
 
 // Raw Meta status enum. We persist this verbatim from Meta (sync + webhook)

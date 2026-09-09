@@ -16,6 +16,7 @@ import {
   templateContentText,
 } from '@/lib/whatsapp/template-body'
 import { supabaseAdmin } from './admin-client'
+import { loadWhatsAppConfigForConversationId } from '@/lib/whatsapp/load-config'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -135,13 +136,13 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+  const config = await loadWhatsAppConfigForConversationId(
+    db,
+    input.accountId,
+    input.conversationId,
+  )
+  if (!config) {
+    throw new Error('WhatsApp not configured for this conversation')
   }
 
   const accessToken = decrypt(config.access_token)

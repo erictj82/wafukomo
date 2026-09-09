@@ -24,11 +24,13 @@ interface OverviewCounts {
   templatesPending: number | null;
   tags: number | null;
   customFields: number | null;
+  branches: number | null;
 }
 
 interface WhatsAppStatus {
   configured: boolean;
   connected: boolean;
+  count: number;
 }
 
 export function SettingsOverview({
@@ -62,7 +64,7 @@ export function SettingsOverview({
     // Cheap counts — resolve fast, render immediately.
     (async () => {
       setCountsLoading(true);
-      const [membersRes, invitesRes, templatesTotal, templatesPending, tagsRes, fieldsRes] =
+      const [membersRes, invitesRes, templatesTotal, templatesPending, tagsRes, fieldsRes, branchesRes] =
         await Promise.allSettled([
           fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
           canManageMembers
@@ -84,6 +86,10 @@ export function SettingsOverview({
             .select('id', { count: 'exact', head: true })
             .eq('user_id', userId),
           supabase.from('custom_fields').select('id', { count: 'exact', head: true }),
+          supabase
+            .from('branches')
+            .select('id', { count: 'exact', head: true })
+            .eq('account_id', acctId),
         ]);
 
       if (cancelled) return;
@@ -113,6 +119,8 @@ export function SettingsOverview({
         tags: tagsRes.status === 'fulfilled' ? tagsRes.value.count ?? null : null,
         customFields:
           fieldsRes.status === 'fulfilled' ? fieldsRes.value.count ?? null : null,
+        branches:
+          branchesRes.status === 'fulfilled' ? branchesRes.value.count ?? null : null,
       });
       setCountsLoading(false);
     })();
@@ -120,18 +128,21 @@ export function SettingsOverview({
     // WhatsApp connection status — slower, independent.
     (async () => {
       setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
+      const [row] = await Promise.allSettled([
         supabase
           .from('whatsapp_config')
-          .select('phone_number_id')
-          .eq('account_id', acctId)
-          .maybeSingle(),
-        fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
+          .select('id, status')
+          .eq('account_id', acctId),
       ]);
       if (cancelled) return;
+      const configs =
+        row.status === 'fulfilled' && Array.isArray(row.value.data)
+          ? row.value.data
+          : [];
       setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
-        connected: health.status === 'fulfilled' && !!health.value?.connected,
+        configured: configs.length > 0,
+        connected: configs.some((c: { status?: string }) => c.status === 'connected'),
+        count: configs.length,
       });
       setWhatsappLoading(false);
     })();
@@ -163,15 +174,20 @@ export function SettingsOverview({
       loading: whatsappLoading,
       subtitle: !whatsapp?.configured ? (
         t('notSetup')
-      ) : whatsapp.connected ? (
-        <>
-          <StatusDot tone="ok" /> {t('connected')}
-        </>
       ) : (
         <>
-          <StatusDot tone="muted" /> {t('needsReconnecting')}
+          <StatusDot tone={whatsapp.connected ? 'ok' : 'muted'} />{' '}
+          {t('numbersCount', { count: whatsapp.count })}
         </>
       ),
+    },
+    {
+      section: 'branches',
+      loading: countsLoading,
+      subtitle:
+        counts?.branches == null
+          ? t('manageBranches')
+          : t('branchesCount', { count: counts.branches }),
     },
     {
       section: 'members',

@@ -13,8 +13,8 @@ import {
   Zap,
   AlertTriangle,
   RotateCcw,
+  Plus,
 } from 'lucide-react';
-import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { useTranslations } from 'next-intl';
 import { Button } from '@/components/ui/button';
@@ -23,6 +23,13 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { SettingsPanelHead } from './settings-panel-head';
 import {
   Accordion,
@@ -30,21 +37,24 @@ import {
   AccordionTrigger,
   AccordionContent,
 } from '@/components/ui/accordion';
-import type { WhatsAppConfig as WhatsAppConfigType } from '@/types';
+import { cn } from '@/lib/utils';
+import type { WhatsAppConfigPublic } from '@/lib/whatsapp/config-rows';
 
 const MASKED_TOKEN = '••••••••••••••••';
+const UNASSIGNED_BRANCH = '__none__';
 
 type ConnectionStatus = 'connected' | 'disconnected' | 'unknown';
 type ResetReason = 'token_corrupted' | 'meta_api_error' | null;
 
+interface BranchOption {
+  id: string;
+  name: string;
+  archived_at: string | null;
+  whatsapp_config_id: string | null;
+}
+
 export function WhatsAppConfig() {
   const t = useTranslations('Settings.whatsapp');
-  const supabase = createClient();
-  // After multi-user, whatsapp_config is one-row-per-account, not
-  // one-row-per-user. We pull `accountId` straight off the auth
-  // context and key every read off it — so a teammate who just
-  // joined an account sees the inviter's saved config without
-  // having to re-enter anything.
   const {
     user,
     accountId,
@@ -58,18 +68,18 @@ export function WhatsAppConfig() {
   const [testing, setTesting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [showToken, setShowToken] = useState(false);
-  const [config, setConfig] = useState<WhatsAppConfigType | null>(null);
+  const [configs, setConfigs] = useState<WhatsAppConfigPublic[]>([]);
+  const [branches, setBranches] = useState<BranchOption[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('unknown');
   const [resetReason, setResetReason] = useState<ResetReason>(null);
   const [statusMessage, setStatusMessage] = useState<string>('');
-  // Guards against re-hydrating the form when the load effect below
-  // re-runs for reasons unrelated to actually switching accounts —
-  // e.g. Supabase's onAuthStateChange fires a token refresh (new
-  // `user` object, profileLoading flips true/false) when the browser
-  // tab regains focus. Without this, that churn calls fetchConfig()
-  // again and overwrites whatever the user typed but hadn't saved yet.
   const loadedAccountIdRef = useRef<string | null>(null);
+  const editingIdRef = useRef<string | null>(null);
+  editingIdRef.current = editingId;
 
+  const [displayName, setDisplayName] = useState('');
+  const [branchId, setBranchId] = useState<string>(UNASSIGNED_BRANCH);
   const [phoneNumberId, setPhoneNumberId] = useState('');
   const [wabaId, setWabaId] = useState('');
   const [accessToken, setAccessToken] = useState('');
@@ -77,20 +87,12 @@ export function WhatsAppConfig() {
   const [pin, setPin] = useState('');
   const [tokenEdited, setTokenEdited] = useState(false);
 
-  // Inbound-media mirror (issue #466). Unlike everything else on this
-  // page it is NOT part of handleSave: that path insists on re-entering
-  // the access token so it can re-verify with Meta, which is a silly
-  // toll to pay for flipping a boolean. The switch writes straight to
-  // the row instead — RLS (migration 017) restricts whatsapp_config
-  // UPDATE to admins, hence the canEditSettings gate below; without it
-  // a viewer's toggle would match zero rows and appear to work.
   const [mirrorMedia, setMirrorMedia] = useState(true);
   const [savingMirror, setSavingMirror] = useState(false);
 
-  // True once /register has succeeded on Meta's side (timestamp set
-  // in the row). When false, the saved config is metadata-only and
-  // Meta will silently drop every inbound event — that's the
-  // multi-number bug that prompted this work.
+  const config = editingId
+    ? (configs.find((c) => c.id === editingId) ?? null)
+    : null;
   const isRegistered = Boolean(config?.registered_at);
   const lastRegistrationError = config?.last_registration_error ?? null;
 
@@ -111,80 +113,67 @@ export function WhatsAppConfig() {
       ? `${window.location.origin}/api/whatsapp/webhook`
       : '';
 
-  const fetchConfig = useCallback(async (acctId: string) => {
+  function hydrateForm(row: WhatsAppConfigPublic | null) {
+    if (row) {
+      setEditingId(row.id);
+      setDisplayName(row.display_name || '');
+      setBranchId(row.branch_id || UNASSIGNED_BRANCH);
+      setPhoneNumberId(row.phone_number_id || '');
+      setWabaId(row.waba_id || '');
+      setAccessToken(MASKED_TOKEN);
+      setVerifyToken('');
+      setPin('');
+      setTokenEdited(false);
+      setMirrorMedia(row.mirror_inbound_media !== false);
+      setConnectionStatus(row.status === 'connected' ? 'connected' : 'disconnected');
+    } else {
+      setEditingId(null);
+      setDisplayName('');
+      setBranchId(UNASSIGNED_BRANCH);
+      setPhoneNumberId('');
+      setWabaId('');
+      setAccessToken('');
+      setVerifyToken('');
+      setPin('');
+      setTokenEdited(false);
+      setMirrorMedia(true);
+      setConnectionStatus('disconnected');
+    }
+    setRegistrationProbe(null);
+    setResetReason(null);
+    setStatusMessage('');
+  }
+
+  const fetchConfig = useCallback(async (acctId: string, preferId?: string | null) => {
     setLoading(true);
     try {
-      // Load form values from Supabase (shows what's in DB).
-      // Switched from `user_id` (which would only match the row's
-      // original author) to `account_id` so every member of the
-      // account sees the same saved configuration. UNIQUE(account_id)
-      // on the table guarantees the .maybeSingle() return type
-      // remains accurate.
-      const { data, error } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', acctId)
-        .maybeSingle();
+      const [configRes, branchRes] = await Promise.all([
+        fetch('/api/whatsapp/config', { cache: 'no-store' }),
+        fetch('/api/account/branches', { cache: 'no-store' }),
+      ]);
+      const payload = await configRes.json();
+      const list = (Array.isArray(payload.configs) ? payload.configs : []) as WhatsAppConfigPublic[];
+      setConfigs(list);
 
-      if (error) {
-        console.error('Failed to load config row:', error);
+      if (branchRes.ok) {
+        const bjson = (await branchRes.json()) as { branches?: BranchOption[] };
+        setBranches(bjson.branches ?? []);
       }
 
-      if (data) {
-        setConfig(data);
-        setPhoneNumberId(data.phone_number_id || '');
-        setWabaId(data.waba_id || '');
-        setAccessToken(MASKED_TOKEN);
-        setVerifyToken('');
-        setPin('');
-        setTokenEdited(false);
-        // Undefined on a row read before migration 039 — treat that as
-        // on, matching the webhook's own default.
-        setMirrorMedia(data.mirror_inbound_media !== false);
-      } else {
-        setConfig(null);
-        setPhoneNumberId('');
-        setWabaId('');
-        setAccessToken('');
-        setVerifyToken('');
-        setPin('');
-        setTokenEdited(false);
-        setMirrorMedia(true);
-      }
-      // Clear any stale probe result when reloading the row.
-      setRegistrationProbe(null);
-
-      // Then verify health via the API (decrypts token + pings Meta)
-      if (data) {
-        try {
-          const res = await fetch('/api/whatsapp/config', { method: 'GET' });
-          const payload = await res.json();
-
-          if (payload.connected) {
-            setConnectionStatus('connected');
-            setResetReason(null);
-            setStatusMessage('');
-          } else {
-            setConnectionStatus('disconnected');
-            setResetReason(payload.needs_reset ? 'token_corrupted' : payload.reason === 'meta_api_error' ? 'meta_api_error' : null);
-            setStatusMessage(payload.message || '');
-          }
-        } catch (err) {
-          console.error('Health check failed:', err);
-          setConnectionStatus('disconnected');
-        }
-      } else {
-        setConnectionStatus('disconnected');
-        setResetReason(null);
-        setStatusMessage('');
-      }
+      const keep =
+        (preferId && list.find((c) => c.id === preferId)) ||
+        (editingIdRef.current && list.find((c) => c.id === editingIdRef.current)) ||
+        list[0] ||
+        null;
+      hydrateForm(keep);
+      void acctId;
     } catch (err) {
       console.error('fetchConfig error:', err);
       toast.error('Failed to load WhatsApp configuration');
     } finally {
       setLoading(false);
     }
-  }, [supabase]);
+  }, []);
 
   useEffect(() => {
     // Need both the auth session (`!authLoading`) AND the profile
@@ -205,18 +194,24 @@ export function WhatsAppConfig() {
 
   async function handleToggleMirrorMedia(next: boolean) {
     if (!config || !accountId || savingMirror) return;
-    // Optimistic — the switch should feel instant; a failure rolls it
-    // back rather than leaving the UI ahead of the row.
     const previous = mirrorMedia;
     setMirrorMedia(next);
     setSavingMirror(true);
     try {
-      const { error } = await supabase
-        .from('whatsapp_config')
-        .update({ mirror_inbound_media: next })
-        .eq('account_id', accountId);
-      if (error) throw new Error(error.message);
-      setConfig({ ...config, mirror_inbound_media: next });
+      const res = await fetch('/api/whatsapp/config', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: config.id, mirror_inbound_media: next }),
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload.error || 'Failed to update');
+      }
+      setConfigs((prev) =>
+        prev.map((c) =>
+          c.id === config.id ? { ...c, mirror_inbound_media: next } : c,
+        ),
+      );
     } catch (error) {
       console.error('Failed to update media retention setting:', error);
       setMirrorMedia(previous);
@@ -224,6 +219,27 @@ export function WhatsAppConfig() {
     } finally {
       setSavingMirror(false);
     }
+  }
+
+  async function handleAttachBranch(next: string | null) {
+    if (!next) return;
+    setBranchId(next);
+    if (!editingId || !canEditSettings) return;
+    const res = await fetch('/api/whatsapp/config', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: editingId,
+        branch_id: next === UNASSIGNED_BRANCH ? null : next,
+      }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast.error(payload.error || t('branchSaveFailed'));
+      return;
+    }
+    toast.success(t('branchSaved'));
+    if (accountId) await fetchConfig(accountId, editingId);
   }
 
   async function handleSave() {
@@ -247,11 +263,11 @@ export function WhatsAppConfig() {
         phone_number_id: phoneNumberId.trim(),
         waba_id: wabaId.trim() || null,
         verify_token: verifyToken.trim() || null,
-        // Optional — only sent when the user filled it in. The server
-        // requires it on first save or when changing numbers; for a
-        // simple token rotation, leaving it blank skips re-register.
+        display_name: displayName.trim() || null,
+        branch_id: branchId === UNASSIGNED_BRANCH ? null : branchId,
         pin: pin.trim() || null,
       };
+      if (editingId) payload.id = editingId;
 
       if (tokenEdited && accessToken !== MASKED_TOKEN && accessToken.trim()) {
         payload.access_token = accessToken.trim();
@@ -312,7 +328,7 @@ export function WhatsAppConfig() {
         setPin('');
       }
 
-      if (accountId) await fetchConfig(accountId);
+      if (accountId) await fetchConfig(accountId, data.id || editingId);
     } catch (err) {
       console.error('Save error:', err);
       toast.error('Failed to save configuration');
@@ -324,7 +340,12 @@ export function WhatsAppConfig() {
   async function handleTestConnection() {
     try {
       setTesting(true);
-      const res = await fetch('/api/whatsapp/config', { method: 'GET' });
+      const res = await fetch(
+        editingId
+          ? `/api/whatsapp/config?id=${encodeURIComponent(editingId)}`
+          : '/api/whatsapp/config',
+        { method: 'GET' },
+      );
       const payload = await res.json();
 
       if (payload.connected) {
@@ -355,9 +376,12 @@ export function WhatsAppConfig() {
     setVerifyingRegistration(true);
     setRegistrationProbe(null);
     try {
-      const res = await fetch('/api/whatsapp/config/verify-registration', {
-        method: 'GET',
-      });
+      const res = await fetch(
+        editingId
+          ? `/api/whatsapp/config/verify-registration?id=${encodeURIComponent(editingId)}`
+          : '/api/whatsapp/config/verify-registration',
+        { method: 'GET' },
+      );
       const data = (await res.json()) as RegistrationProbe;
       setRegistrationProbe(data);
       if (data.live) {
@@ -368,7 +392,7 @@ export function WhatsAppConfig() {
           { duration: 8000 },
         );
       }
-      if (accountId) await fetchConfig(accountId);
+      if (accountId) await fetchConfig(accountId, editingId);
     } catch (err) {
       console.error('verify-registration failed:', err);
       toast.error('Could not reach the verification endpoint.');
@@ -378,13 +402,20 @@ export function WhatsAppConfig() {
   }
 
   async function handleReset() {
-    if (!confirm('This will delete the current WhatsApp config so you can re-enter it. Continue?')) {
+    if (!editingId) {
+      toast.error(t('selectNumberToReset'));
+      return;
+    }
+    if (!confirm(t('resetConfirm'))) {
       return;
     }
 
     try {
       setResetting(true);
-      const res = await fetch('/api/whatsapp/config', { method: 'DELETE' });
+      const res = await fetch(
+        `/api/whatsapp/config?id=${encodeURIComponent(editingId)}`,
+        { method: 'DELETE' },
+      );
       const data = await res.json();
 
       if (!res.ok) {
@@ -392,16 +423,8 @@ export function WhatsAppConfig() {
         return;
       }
 
-      toast.success('Configuration cleared. You can now re-enter your credentials.');
-      setConfig(null);
-      setPhoneNumberId('');
-      setWabaId('');
-      setAccessToken('');
-      setVerifyToken('');
-      setTokenEdited(false);
-      setConnectionStatus('disconnected');
-      setResetReason(null);
-      setStatusMessage('');
+      toast.success(t('resetDone'));
+      if (accountId) await fetchConfig(accountId, null);
     } catch (err) {
       console.error('Reset error:', err);
       toast.error('Failed to reset configuration');
@@ -436,7 +459,60 @@ export function WhatsAppConfig() {
       <SettingsPanelHead
         title={t("title")}
         description={t("description")}
+        action={
+          canEditSettings ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => hydrateForm(null)}
+            >
+              <Plus className="size-4" />
+              {t('addNumber')}
+            </Button>
+          ) : null
+        }
       />
+
+      {configs.length > 0 ? (
+        <div className="mb-6 grid gap-3 sm:grid-cols-2">
+          {configs.map((row) => {
+            const branchName = branches.find((b) => b.id === row.branch_id)?.name;
+            const selected = editingId === row.id;
+            return (
+              <button
+                key={row.id}
+                type="button"
+                onClick={() => hydrateForm(row)}
+                className={cn(
+                  'rounded-xl border p-4 text-left transition-colors',
+                  selected
+                    ? 'border-primary bg-primary-soft'
+                    : 'border-border bg-card hover:border-primary-soft-2',
+                )}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-foreground">
+                      {row.display_name || row.display_phone_number || t('unnamedNumber')}
+                    </div>
+                    <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                      {row.display_phone_number || row.phone_number_id}
+                      {branchName ? ` · ${branchName}` : ` · ${t('unassignedBranch')}`}
+                    </div>
+                  </div>
+                  {row.status === 'connected' ? (
+                    <CheckCircle2 className="size-4 shrink-0 text-primary" />
+                  ) : (
+                    <XCircle className="size-4 shrink-0 text-red-500" />
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+
       <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       {/* Main config form */}
       <div className="space-y-6">
@@ -607,6 +683,75 @@ export function WhatsAppConfig() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-muted-foreground">{t('displayName')}</Label>
+              <Input
+                placeholder={t('displayNamePlaceholder')}
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                onBlur={() => {
+                  if (!editingId || !canEditSettings) return;
+                  void fetch('/api/whatsapp/config', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      id: editingId,
+                      display_name: displayName.trim() || null,
+                    }),
+                  }).then(async (res) => {
+                    if (res.ok) {
+                      setConfigs((prev) =>
+                        prev.map((c) =>
+                          c.id === editingId
+                            ? { ...c, display_name: displayName.trim() || null }
+                            : c,
+                        ),
+                      );
+                    }
+                  });
+                }}
+                disabled={!canEditSettings}
+                className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-muted-foreground">{t('branch')}</Label>
+              <Select
+                value={branchId}
+                onValueChange={(v) => v && void handleAttachBranch(v)}
+              >
+                <SelectTrigger
+                  className="bg-muted border-border"
+                  disabled={!canEditSettings}
+                >
+                  <SelectValue>
+                    {branchId === UNASSIGNED_BRANCH
+                      ? t('unassignedBranch')
+                      : (branches.find((b) => b.id === branchId)?.name ??
+                        t('unassignedBranch'))}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={UNASSIGNED_BRANCH}>
+                    {t('unassignedBranch')}
+                  </SelectItem>
+                  {branches
+                    .filter(
+                      (b) =>
+                        !b.archived_at &&
+                        (!b.whatsapp_config_id || b.whatsapp_config_id === editingId),
+                    )
+                    .map((b) => (
+                      <SelectItem key={b.id} value={b.id}>
+                        {b.name}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t('branchHint')}</p>
+            </div>
+
             <div className="space-y-2">
               <Label className="text-muted-foreground">{t('phoneNumberId')}</Label>
               <Input

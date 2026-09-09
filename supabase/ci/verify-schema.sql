@@ -236,6 +236,46 @@ BEGIN
     RAISE EXCEPTION 'idx_kpi_response_daily_unattributed_grain is missing — migration 040';
   END IF;
 
+  -- 041 replaced the 2-arg inbound bump with a 3-arg version that
+  -- also sets last_customer_message_at / awaiting_response_since.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'bump_conversation_on_inbound'
+      AND p.pronargs = 3
+  ) THEN
+    RAISE EXCEPTION 'bump_conversation_on_inbound must have 3 arguments after migration 041';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'bump_conversation_on_inbound'
+      AND p.pronargs = 2
+  ) THEN
+    RAISE EXCEPTION '2-arg bump_conversation_on_inbound should have been dropped by migration 041';
+  END IF;
+
+  -- Branch-scoped RLS (042). Isolation is this function, not a UI filter.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'can_access_branch'
+      AND p.pronargs = 2
+  ) THEN
+    RAISE EXCEPTION 'can_access_branch(uuid, uuid) is missing — migration 042';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = 'conversations'
+      AND policyname = 'conversations_select'
+  ) THEN
+    RAISE EXCEPTION 'conversations_select is missing — migration 042';
+  END IF;
+
   RAISE NOTICE 'schema verification passed';
 END
 $$;

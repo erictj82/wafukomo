@@ -12,7 +12,18 @@ import { SendMessageError } from './send-message';
 type ContactRow = { id: string; phone: string; name?: string | null };
 
 interface Script {
-  config?: { user_id: string } | null; // whatsapp_config.maybeSingle
+  config?: {
+    id?: string;
+    user_id: string;
+    branch_id?: string | null;
+    phone_number_id?: string;
+    access_token?: string;
+  } | null;
+  configs?: Array<{
+    id: string;
+    user_id: string;
+    branch_id?: string | null;
+  }>;
   contactCandidates?: ContactRow[]; // contacts .like (same every call)
   /** Per-call `.like` results — overrides contactCandidates. Lets a
    *  test simulate "miss, then hit" for the unique-race path. */
@@ -29,11 +40,26 @@ interface Script {
   insertConversationError?: { code?: string } | null;
 }
 
+function configList(script: Script) {
+  if (script.configs) return script.configs;
+  if (script.config === null || script.config === undefined) return [];
+  return [
+    {
+      id: script.config.id ?? 'cfg-1',
+      user_id: script.config.user_id,
+      branch_id: script.config.branch_id ?? null,
+      phone_number_id: script.config.phone_number_id ?? 'pn-1',
+      access_token: script.config.access_token ?? 'tok',
+    },
+  ];
+}
+
 function makeDb(script: Script): SupabaseClient {
   let table = '';
   let mode: 'select' | 'insert' | 'update' = 'select';
   let likeCalls = 0;
   let convLookupCalls = 0;
+  const eqs: Record<string, string> = {};
 
   const builder: Record<string, unknown> = {
     select: () => builder,
@@ -45,16 +71,21 @@ function makeDb(script: Script): SupabaseClient {
       mode = 'update';
       return builder;
     },
-    eq: () => builder,
+    eq: (col: string, val: string) => {
+      eqs[col] = val;
+      return builder;
+    },
     order: () => builder,
     limit: () => {
-      // Only the conversation lookup terminates on `.limit(1)`.
       if (table === 'conversations' && mode === 'select') {
         const row = script.existingConversationByCall
           ? (script.existingConversationByCall[convLookupCalls] ?? null)
           : (script.existingConversation ?? null);
         convLookupCalls++;
         return Promise.resolve({ data: row ? [row] : [], error: null });
+      }
+      if (table === 'whatsapp_config' && mode === 'select') {
+        return Promise.resolve({ data: configList(script), error: null });
       }
       return Promise.resolve({ data: [], error: null });
     },
@@ -66,8 +97,13 @@ function makeDb(script: Script): SupabaseClient {
       return Promise.resolve({ data, error: null });
     },
     maybeSingle: () => {
-      if (table === 'whatsapp_config')
-        return Promise.resolve({ data: script.config ?? null, error: null });
+      if (table === 'whatsapp_config') {
+        const list = configList(script);
+        const row = eqs.id
+          ? (list.find((c) => c.id === eqs.id) ?? null)
+          : (list[0] ?? null);
+        return Promise.resolve({ data: row, error: null });
+      }
       return Promise.resolve({ data: null, error: null });
     },
     single: () => {
@@ -95,15 +131,22 @@ function makeDb(script: Script): SupabaseClient {
       }
       return Promise.resolve({ data: null, error: null });
     },
-    // Thenable: `await db.from().update().eq()` lands here.
-    then: (resolve: (v: { data: null; error: null }) => void) =>
-      resolve({ data: null, error: null }),
+    // Thenable: config list (`select.eq.order`) and updates land here.
+    then: (
+      resolve: (v: { data: unknown; error: null }) => void,
+    ) => {
+      if (table === 'whatsapp_config' && mode === 'select') {
+        return resolve({ data: configList(script), error: null });
+      }
+      return resolve({ data: null, error: null });
+    },
   };
 
   return {
     from: (t: string) => {
       table = t;
       mode = 'select';
+      for (const key of Object.keys(eqs)) delete eqs[key];
       return builder;
     },
   } as unknown as SupabaseClient;
@@ -206,5 +249,36 @@ describe('resolveConversationByPhone', () => {
       contactId: 'c1',
       contactCreated: false,
     });
+  });
+
+  it('requires whatsapp_config_id when the account has two numbers', async () => {
+    const db = makeDb({
+      configs: [
+        { id: 'cfg-a', user_id: 'owner-1' },
+        { id: 'cfg-b', user_id: 'owner-1' },
+      ],
+    });
+    await expect(
+      resolveConversationByPhone(db, 'acct', '+14155550123')
+    ).rejects.toMatchObject({ code: 'whatsapp_config_required', status: 400 });
+  });
+
+  it('uses the named number when two configs exist', async () => {
+    const db = makeDb({
+      configs: [
+        { id: 'cfg-a', user_id: 'owner-1', branch_id: 'br-a' },
+        { id: 'cfg-b', user_id: 'owner-1', branch_id: 'br-b' },
+      ],
+      contactCandidates: [{ id: 'c1', phone: '14155550123' }],
+      existingConversation: { id: 'cv-b' },
+    });
+    const res = await resolveConversationByPhone(
+      db,
+      'acct',
+      '+14155550123',
+      null,
+      'cfg-b'
+    );
+    expect(res.conversationId).toBe('cv-b');
   });
 });

@@ -1,12 +1,13 @@
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
-import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
+import { getMediaUrl } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
+import { findOrCreateConversationForConfig } from '@/lib/whatsapp/conversation-identity'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
@@ -246,23 +247,12 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const value = change.value
 
-      // Handle status updates
-      if (value.statuses) {
-        for (const status of value.statuses) {
-          await handleStatusUpdate(status)
-        }
-      }
+      const phoneNumberId = value.metadata?.phone_number_id
+      if (!phoneNumberId) continue
 
-      // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
-
-      const phoneNumberId = value.metadata.phone_number_id
-
-      // Find user's config by phone_number_id. `.single()` returns
-      // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
-      // operators see the real cause in logs. ≥2 rows shouldn't happen
-      // post-migration 013 (UNIQUE constraint), but a row created
-      // before the constraint, or a race, would still surface here.
+      // Find the number by phone_number_id — never by account_id.
+      // `.single()` returns PGRST116 for both 0 rows AND ≥2 rows —
+      // distinguish them so operators see the real cause in logs.
       const { data: configRows, error: configError } = await supabaseAdmin()
         .from('whatsapp_config')
         .select('*')
@@ -295,6 +285,16 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const config = configRows[0]
 
+      // Handle status updates against THIS number only.
+      if (value.statuses) {
+        for (const status of value.statuses) {
+          await handleStatusUpdate(status, config.id)
+        }
+      }
+
+      // Handle incoming messages
+      if (!value.messages || !value.contacts) continue
+
       const decryptedAccessToken = decrypt(config.access_token)
 
       for (let i = 0; i < value.messages.length; i++) {
@@ -315,7 +315,9 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           // Default ON: the column is NOT NULL DEFAULT TRUE, but a row
           // read before migration 039 lands would have it undefined,
           // and losing attachments is the failure mode worth avoiding.
-          config.mirror_inbound_media !== false
+          config.mirror_inbound_media !== false,
+          config.id,
+          config.branch_id ?? null
         )
       }
     }
@@ -364,24 +366,53 @@ function isValidStatusTransition(current: string, incoming: string): boolean {
   return ii > ci
 }
 
-async function handleStatusUpdate(status: {
-  id: string
-  status: string
-  timestamp: string
-  recipient_id: string
-}) {
-  // 1) Mirror onto messages (legacy behavior) — Meta's status values
-  //    already match the CHECK constraint on messages.status. No
-  //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
-  //    repeat across numbers), so this updates 0..N rows and must not
-  //    assume a single row.
-  const { error: msgErr } = await supabaseAdmin()
+async function handleStatusUpdate(
+  status: {
+    id: string
+    status: string
+    timestamp: string
+    recipient_id: string
+  },
+  whatsappConfigId: string
+) {
+  // 1) Mirror onto messages for THIS WhatsApp number only. Meta
+  //    wamids are not globally unique (migration 009); filtering by
+  //    conversation.whatsapp_config_id keeps number A's delivery
+  //    receipt from flipping number B's row.
+  const { data: statusRows, error: lookupErr } = await supabaseAdmin()
     .from('messages')
-    .update({ status: status.status })
+    .select('id, conversation_id, conversations!inner(whatsapp_config_id, account_id)')
     .eq('message_id', status.id)
 
-  if (msgErr) {
-    console.error('Error updating message status:', msgErr)
+  if (lookupErr) {
+    console.error('Error looking up message for status update:', lookupErr)
+  }
+
+  const matching = (statusRows ?? []).filter((row: {
+    conversations?: { whatsapp_config_id?: string } | { whatsapp_config_id?: string }[] | null
+  }) => {
+    const conv = Array.isArray(row.conversations)
+      ? row.conversations[0]
+      : row.conversations
+    return conv?.whatsapp_config_id === whatsappConfigId
+  }) as Array<{
+    id: string
+    conversation_id: string
+    conversations?: { account_id?: string } | { account_id?: string }[] | null
+  }>
+
+  if (matching.length > 0) {
+    const { error: msgErr } = await supabaseAdmin()
+      .from('messages')
+      .update({ status: status.status })
+      .in(
+        'id',
+        matching.map((r) => r.id)
+      )
+
+    if (msgErr) {
+      console.error('Error updating message status:', msgErr)
+    }
   }
 
   // Webhook fan-out for this status change happens at the END of this
@@ -427,15 +458,14 @@ async function handleStatusUpdate(status: {
   //    Runs last so a slow subscriber can't delay the mirrors above.
   //    Bounded to one row (message_id isn't unique) purely to resolve
   //    the owning account for delivery.
-  const { data: msgRow } = await supabaseAdmin()
-    .from('messages')
-    .select('conversation_id, conversations(account_id)')
-    .eq('message_id', status.id)
-    .limit(1)
-    .maybeSingle()
+  const { data: msgRow } = matching.length > 0
+    ? { data: matching[0] }
+    : { data: null }
 
   if (msgRow) {
-    const conv = msgRow.conversations as { account_id: string } | null
+    const conv = Array.isArray(msgRow.conversations)
+      ? msgRow.conversations[0]
+      : msgRow.conversations
     const accountId = conv?.account_id
     if (accountId) {
       await dispatchWebhookEvent(
@@ -586,7 +616,9 @@ async function processMessage(
   accessToken: string,
   // Per-account opt-out for the inbound-media mirror (migration 039).
   // See parseMessageContent for what it turns off.
-  mirrorMedia: boolean
+  mirrorMedia: boolean,
+  whatsappConfigId: string,
+  branchId: string | null
 ) {
   const senderPhone = normalizePhone(message.from)
   const contactName = contact.profile.name
@@ -601,11 +633,13 @@ async function processMessage(
   if (!contactOutcome) return
   const contactRecord = contactOutcome.contact
 
-  // Find or create conversation
+  // Find or create conversation for THIS WhatsApp number.
   const convResult = await findOrCreateConversation(
     accountId,
     configOwnerUserId,
-    contactRecord.id
+    contactRecord.id,
+    whatsappConfigId,
+    branchId
   )
   if (!convResult) return
   const conversation = convResult.conversation
@@ -751,6 +785,7 @@ async function processMessage(
     {
       p_conversation_id: conversation.id,
       p_last_message_text: contentText || `[${message.type}]`,
+      p_inbound_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
     }
   )
 
@@ -1176,69 +1211,14 @@ async function findOrCreateConversation(
   accountId: string,
   configOwnerUserId: string,
   contactId: string,
+  whatsappConfigId: string,
+  branchId: string | null
 ) {
-  // Look for an existing conversation in this account, oldest-first.
-  //
-  // We deliberately do NOT use `.single()` here. `.single()` errors on
-  // *both* 0 rows and ≥2 rows, and the old code treated any error as
-  // "none found" and inserted a new row. So once two conversations
-  // existed for a contact (from a race — Meta retries a delivery, or a
-  // batch fans out to concurrent runs), every subsequent inbound
-  // message errored on the lookup and created yet another conversation,
-  // snowballing into a wall of duplicate chats (issue #363).
-  //
-  // Ordering oldest-first and taking one row makes the lookup resolve to
-  // the same canonical survivor the dedup migration (036) keeps, so any
-  // pre-existing duplicates converge instead of compounding.
-  const { data: existingRows, error: findError } = await supabaseAdmin()
-    .from('conversations')
-    .select('*')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .order('created_at', { ascending: true })
-    .limit(1)
-
-  if (findError) {
-    console.error('Error finding conversation:', findError)
-    return null
-  }
-
-  if (existingRows && existingRows.length > 0) {
-    return { conversation: existingRows[0], created: false }
-  }
-
-  // Create new conversation. Same tenancy + audit split as
-  // findOrCreateContact above.
-  const { data: newConv, error: createError } = await supabaseAdmin()
-    .from('conversations')
-    .insert({
-      account_id: accountId,
-      user_id: configOwnerUserId,
-      contact_id: contactId,
-    })
-    .select()
-    .single()
-
-  if (createError) {
-    // Lost a race: a concurrent inbound delivery created the
-    // conversation between our lookup and insert, and the unique index
-    // (migration 036) rejected the duplicate. Re-resolve the winning
-    // row instead of dropping the message — mirrors findOrCreateContact.
-    if (isUniqueViolation(createError)) {
-      const { data: raced } = await supabaseAdmin()
-        .from('conversations')
-        .select('*')
-        .eq('account_id', accountId)
-        .eq('contact_id', contactId)
-        .order('created_at', { ascending: true })
-        .limit(1)
-      if (raced && raced.length > 0) {
-        return { conversation: raced[0], created: false }
-      }
-    }
-    console.error('Error creating conversation:', createError)
-    return null
-  }
-
-  return { conversation: newConv, created: true }
+  return findOrCreateConversationForConfig(supabaseAdmin(), {
+    accountId,
+    contactId,
+    ownerUserId: configOwnerUserId,
+    whatsappConfigId,
+    branchId,
+  })
 }

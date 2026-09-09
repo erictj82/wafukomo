@@ -74,12 +74,16 @@ export async function resolveAuditUserId(
   db: SupabaseClient,
   accountId: string
 ): Promise<string> {
-  const { data: config } = await db
+  // `.maybeSingle()` errors (PGRST116) when an account has two numbers.
+  // Oldest-first `.limit(1)` keeps the same attribution as a single-number
+  // account without guessing among tokens — this is audit only, not send.
+  const { data: configs } = await db
     .from('whatsapp_config')
     .select('user_id')
     .eq('account_id', accountId)
-    .maybeSingle();
-  const configOwner = config?.user_id as string | undefined;
+    .order('created_at', { ascending: true })
+    .limit(1);
+  const configOwner = configs?.[0]?.user_id as string | undefined;
   if (configOwner) return configOwner;
 
   const { data: account } = await db

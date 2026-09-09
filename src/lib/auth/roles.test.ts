@@ -7,6 +7,7 @@ import {
   canManageMembers,
   canSendMessages,
   canTransferOwnership,
+  canViewAllBranches,
   canViewOnly,
   hasMinRole,
   isAccountRole,
@@ -112,6 +113,13 @@ describe("capability predicates", () => {
     expect(canViewOnly("admin")).toBe(false);
     expect(canViewOnly("agent")).toBe(false);
     expect(canViewOnly("viewer")).toBe(true);
+  });
+
+  it("canViewAllBranches: admin+", () => {
+    expect(canViewAllBranches("owner")).toBe(true);
+    expect(canViewAllBranches("admin")).toBe(true);
+    expect(canViewAllBranches("agent")).toBe(false);
+    expect(canViewAllBranches("viewer")).toBe(false);
   });
 
   it("canDeleteAccount: owner only", () => {

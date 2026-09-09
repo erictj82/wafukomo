@@ -206,16 +206,23 @@ interface CapturedWrites {
  */
 function sendPathDb(
   templateRows: unknown[],
-  captured: CapturedWrites
+  captured: CapturedWrites,
+  overrides: {
+    conversation?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+  } = {}
 ): SupabaseClient {
   const conversation = {
     id: 'cv-1',
+    whatsapp_config_id: 'cfg-1',
     contact: { id: 'ct-1', phone: '+15551234567' },
+    ...overrides.conversation,
   };
   const config = {
     id: 'cfg-1',
     phone_number_id: 'pn-1',
     access_token: 'token',
+    ...overrides.config,
   };
 
   return {
@@ -231,7 +238,10 @@ function sendPathDb(
           if (table === 'conversations') captured.conversation = row;
           return builder;
         },
-        maybeSingle: async () => ({ data: null, error: null }),
+        maybeSingle: async () => {
+          if (table === 'whatsapp_config') return { data: config, error: null };
+          return { data: null, error: null };
+        },
         single: async () => {
           if (table === 'conversations') {
             return { data: conversation, error: null };
@@ -344,5 +354,46 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
     // name rather than inventing a body.
     expect(captured.message?.content_text).toBeNull();
     expect(captured.conversation?.last_message_text).toBe('[template]');
+  });
+});
+
+describe('sendMessageToConversation — multi-number + agent waiting state', () => {
+  it('sends through the conversation WhatsApp number, not a sibling config', async () => {
+    sendTemplateMessage.mockClear();
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(
+      sendPathDb([TEMPLATE_ROW], captured, {
+        conversation: { whatsapp_config_id: 'cfg-b' },
+        config: { id: 'cfg-b', phone_number_id: 'pn-b' },
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+      }
+    );
+    expect(
+      (sendTemplateMessage.mock.calls[0] as unknown as [{ phoneNumberId: string }])[0]
+        .phoneNumberId
+    ).toBe('pn-b');
+    expect(captured.message?.sender_id).toBeNull();
+    expect(captured.conversation).not.toHaveProperty('last_human_reply_at');
+    expect(captured.conversation).not.toHaveProperty('awaiting_response_since');
+  });
+
+  it('records the dashboard agent and closes waiting state', async () => {
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'on it',
+      agentUserId: 'agent-42',
+    });
+    expect(captured.message?.sender_type).toBe('agent');
+    expect(captured.message?.sender_id).toBe('agent-42');
+    expect(captured.conversation?.last_human_reply_at).toEqual(expect.any(String));
+    expect(captured.conversation?.awaiting_response_since).toBeNull();
   });
 });

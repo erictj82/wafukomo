@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import { loadWhatsAppConfigForConversationId } from '@/lib/whatsapp/load-config'
 
 export async function GET(
   request: Request,
@@ -48,18 +49,29 @@ export async function GET(
       )
     }
 
-    // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    // Token belongs to the conversation that stored this proxy URL.
+    // Guessing among an account's numbers would fetch with the wrong
+    // Meta token (and 404 from Meta, or worse, leak across numbers).
+    const proxyPath = `/api/whatsapp/media/${mediaId}`
+    const { data: mediaRow } = await supabase
+      .from('messages')
+      .select('id, conversation_id')
+      .eq('media_url', proxyPath)
+      .limit(1)
+      .maybeSingle()
 
-    if (configError || !config) {
-      return NextResponse.json(
-        { error: 'WhatsApp not configured' },
-        { status: 400 }
-      )
+    if (!mediaRow?.conversation_id) {
+      return NextResponse.json({ error: 'Media not found' }, { status: 404 })
+    }
+
+    const config = await loadWhatsAppConfigForConversationId(
+      supabase,
+      accountId,
+      mediaRow.conversation_id as string
+    )
+
+    if (!config) {
+      return NextResponse.json({ error: 'Media not found' }, { status: 404 })
     }
 
     const accessToken = decrypt(config.access_token)

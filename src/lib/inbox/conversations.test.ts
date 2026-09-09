@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  conversationInboxBadge,
   matchesContactFilters,
+  matchesInboxScope,
   normalizeConversation,
 } from "./conversations";
 import type { Conversation } from "@/types";
@@ -128,6 +130,30 @@ describe("normalizeConversation", () => {
     ).toBeUndefined();
   });
 
+  it("collapses whatsapp_config / branch embeds to a single object", () => {
+    const raw = {
+      id: "c1",
+      user_id: "u1",
+      contact_id: "ct1",
+      status: "open" as const,
+      unread_count: 0,
+      created_at: "",
+      updated_at: "",
+      contact: null,
+      whatsapp_config: [
+        { id: "cfg-a", display_name: "Iseo", display_phone_number: "+62" },
+      ],
+      branch: { id: "br-1", name: "Iseo Salon" },
+    };
+    const normalized = normalizeConversation(raw);
+    expect(normalized.whatsapp_config).toEqual({
+      id: "cfg-a",
+      display_name: "Iseo",
+      display_phone_number: "+62",
+    });
+    expect(normalized.branch).toEqual({ id: "br-1", name: "Iseo Salon" });
+  });
+
   it("passes through a conversation with no contact", () => {
     const raw = {
       id: "c1",
@@ -141,5 +167,92 @@ describe("normalizeConversation", () => {
     };
     // A contactless row passes through untouched (consumers use `?.`).
     expect(normalizeConversation(raw).contact).toBeNull();
+  });
+});
+
+describe("matchesInboxScope", () => {
+  const base = (): Conversation => ({
+    id: "c1",
+    user_id: "u1",
+    contact_id: "ct1",
+    status: "open",
+    unread_count: 0,
+    created_at: "",
+    updated_at: "",
+    branch_id: "br-1",
+    whatsapp_config_id: "cfg-a",
+    awaiting_response_since: "2026-01-01T00:00:00Z",
+  });
+
+  it("matches everything when no scope is set", () => {
+    expect(
+      matchesInboxScope(base(), {
+        branchId: null,
+        whatsappConfigId: null,
+        unansweredOnly: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("filters by branch and number", () => {
+    expect(
+      matchesInboxScope(base(), {
+        branchId: "br-1",
+        whatsappConfigId: "cfg-a",
+        unansweredOnly: false,
+      }),
+    ).toBe(true);
+    expect(
+      matchesInboxScope(base(), {
+        branchId: "br-2",
+        whatsappConfigId: null,
+        unansweredOnly: false,
+      }),
+    ).toBe(false);
+    expect(
+      matchesInboxScope(base(), {
+        branchId: null,
+        whatsappConfigId: "cfg-b",
+        unansweredOnly: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("unansweredOnly requires awaiting_response_since", () => {
+    expect(
+      matchesInboxScope(base(), {
+        branchId: null,
+        whatsappConfigId: null,
+        unansweredOnly: true,
+      }),
+    ).toBe(true);
+    expect(
+      matchesInboxScope(
+        { ...base(), awaiting_response_since: null },
+        { branchId: null, whatsappConfigId: null, unansweredOnly: true },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("conversationInboxBadge", () => {
+  it("prefers display_name then phone, then branch name", () => {
+    expect(
+      conversationInboxBadge({
+        id: "c1",
+        user_id: "u1",
+        contact_id: "ct1",
+        status: "open",
+        unread_count: 0,
+        created_at: "",
+        updated_at: "",
+        whatsapp_config: {
+          id: "cfg-a",
+          display_name: "Iseo",
+          display_phone_number: "+62",
+        },
+        branch: { id: "br-1", name: "Iseo Salon" },
+      }),
+    ).toEqual({ number: "Iseo", branch: "Iseo Salon" });
   });
 });

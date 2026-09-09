@@ -9,7 +9,7 @@
 //
 // It deliberately reuses the exact find-or-create logic the inbound
 // webhook uses (the `findExistingContact` dedupe helper, the
-// one-conversation-per-(account, contact) convention, the
+// (account, whatsapp_config, contact) conversation identity, the
 // account_id-tenancy / user_id-audit split) so a contact created via
 // the API is indistinguishable from one created by an inbound message.
 //
@@ -24,6 +24,8 @@ import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 import { SendMessageError } from '@/lib/whatsapp/send-message';
 import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';
+import { findOrCreateConversationForConfig } from '@/lib/whatsapp/conversation-identity';
+import { resolveWhatsAppConfigForAccount } from '@/lib/whatsapp/load-config';
 
 export interface ResolvedConversation {
   conversationId: string;
@@ -42,7 +44,8 @@ export async function resolveConversationByPhone(
   db: SupabaseClient,
   accountId: string,
   phone: string,
-  name?: string | null
+  name?: string | null,
+  whatsappConfigId?: string | null
 ): Promise<ResolvedConversation> {
   const sanitized = sanitizePhoneForMeta(phone);
   if (!isValidE164(sanitized)) {
@@ -54,19 +57,24 @@ export async function resolveConversationByPhone(
   }
 
   // Fail fast (and create nothing) when the account has no WhatsApp
-  // connected — the same error the send would raise anyway.
-  const { data: config } = await db
-    .from('whatsapp_config')
-    .select('id')
-    .eq('account_id', accountId)
-    .maybeSingle();
-  if (!config) {
+  // connected — the same error the send would raise anyway. With two
+  // or more numbers the caller must name which one; a sole number is
+  // accepted so existing single-number API clients keep working.
+  const resolvedConfig = await resolveWhatsAppConfigForAccount(
+    db,
+    accountId,
+    whatsappConfigId
+  );
+  if (!resolvedConfig.ok) {
     throw new SendMessageError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      resolvedConfig.code,
+      resolvedConfig.code === 'whatsapp_config_required'
+        ? 'whatsapp_config_id is required when the account has more than one WhatsApp number'
+        : 'WhatsApp not configured. Please set up your WhatsApp integration first.',
       400
     );
   }
+  const config = resolvedConfig.config;
 
   // Audit user for created rows = the single account-wide default used
   // by every public-API write (see resolveAuditUserId), so a contact
@@ -137,76 +145,21 @@ export async function resolveConversationByPhone(
   }
 
   // ---- conversation -------------------------------------------
-  // One conversation per (account, contact) — same convention as the
-  // webhook. Order oldest-first and take one row rather than
-  // `.maybeSingle()`, which errors on ≥2 rows: if duplicates predate the
-  // unique index (migration 036), we resolve to the canonical survivor
-  // instead of falling through and creating yet another (issue #363).
-  const conversationId = await findOrCreateConversationRow(
-    db,
+  // One conversation per (account, WhatsApp number, contact).
+  const found = await findOrCreateConversationForConfig(db, {
     accountId,
     contactId,
-    ownerUserId
-  );
-
-  return { conversationId, contactId, contactCreated };
-}
-
-/**
- * Find (oldest-first) or create the single conversation for
- * `(accountId, contactId)`. Handles the unique-index race the same way
- * the inbound webhook does: on a 23505 from a concurrent create,
- * re-resolve the winning row rather than failing the send.
- */
-async function findOrCreateConversationRow(
-  db: SupabaseClient,
-  accountId: string,
-  contactId: string,
-  ownerUserId: string
-): Promise<string> {
-  const { data: existing, error: findErr } = await db
-    .from('conversations')
-    .select('id')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .order('created_at', { ascending: true })
-    .limit(1);
-
-  if (findErr) {
-    console.error('[resolve-conversation] conversation lookup error:', findErr);
-    throw new SendMessageError('db_error', 'Failed to resolve conversation', 500);
+    ownerUserId,
+    whatsappConfigId: config.id,
+    branchId: config.branch_id,
+  });
+  if (!found) {
+    throw new SendMessageError(
+      'db_error',
+      'Failed to resolve conversation',
+      500
+    );
   }
 
-  if (existing && existing.length > 0) {
-    return existing[0].id;
-  }
-
-  const { data: newConv, error: convErr } = await db
-    .from('conversations')
-    .insert({
-      account_id: accountId,
-      user_id: ownerUserId,
-      contact_id: contactId,
-    })
-    .select('id')
-    .single();
-
-  if (convErr || !newConv) {
-    if (isUniqueViolation(convErr)) {
-      const { data: raced } = await db
-        .from('conversations')
-        .select('id')
-        .eq('account_id', accountId)
-        .eq('contact_id', contactId)
-        .order('created_at', { ascending: true })
-        .limit(1);
-      if (raced && raced.length > 0) {
-        return raced[0].id;
-      }
-    }
-    console.error('[resolve-conversation] conversation create error:', convErr);
-    throw new SendMessageError('db_error', 'Failed to create conversation', 500);
-  }
-
-  return newConv.id;
+  return { conversationId: found.conversation.id, contactId, contactCreated };
 }

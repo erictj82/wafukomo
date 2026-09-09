@@ -4,7 +4,9 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   CONVERSATION_SELECT,
+  conversationInboxBadge,
   matchesContactFilters,
+  matchesInboxScope,
   normalizeConversations,
 } from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
@@ -44,7 +46,17 @@ const STATUS_COLORS: Record<ConversationStatus, string> = {
 
 
 
-type InboxFilter = ConversationStatus | "all" | "unread";
+type InboxFilter = ConversationStatus | "all" | "unread" | "unanswered";
+
+interface BranchOption {
+  id: string;
+  name: string;
+}
+
+interface NumberOption {
+  id: string;
+  label: string;
+}
 
 export function ConversationList({
   activeConversationId,
@@ -61,6 +73,7 @@ export function ConversationList({
     { label: t("filterOpen"), value: "open" },
     { label: t("filterPending"), value: "pending" },
     { label: t("filterClosed"), value: "closed" },
+    { label: t("filterUnanswered"), value: "unanswered" },
   ], [t]);
 
   const [search, setSearch] = useState("");
@@ -72,6 +85,10 @@ export function ConversationList({
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
+  const [branches, setBranches] = useState<BranchOption[]>([]);
+  const [numbers, setNumbers] = useState<NumberOption[]>([]);
+  const [selectedBranchId, setSelectedBranchId] = useState<string | null>(null);
+  const [selectedConfigId, setSelectedConfigId] = useState<string | null>(null);
 
   // Keep the latest callback in a ref so the fetch effect below can
   // have a stable, empty-dep identity. Previously the fetch useCallback
@@ -140,6 +157,48 @@ export function ConversationList({
     };
   }, []);
 
+  // Branches + numbers the caller can already see (RLS). Used for
+  // owner/admin switchers and for everyone else's badge labels when
+  // the conversation embed is missing a join.
+  useEffect(() => {
+    const supabase = createClient();
+    let cancelled = false;
+    (async () => {
+      const [bRes, nRes] = await Promise.all([
+        supabase
+          .from("branches")
+          .select("id, name")
+          .is("archived_at", null)
+          .order("name"),
+        supabase
+          .from("whatsapp_config")
+          .select("id, display_name, display_phone_number"),
+      ]);
+      if (cancelled) return;
+      if (bRes.data) {
+        setBranches(bRes.data as BranchOption[]);
+      }
+      if (nRes.data) {
+        setNumbers(
+          (nRes.data as Array<{
+            id: string;
+            display_name: string | null;
+            display_phone_number: string | null;
+          }>).map((row) => ({
+            id: row.id,
+            label:
+              row.display_name?.trim() ||
+              row.display_phone_number?.trim() ||
+              row.id,
+          })),
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Company options are derived from the loaded conversations — there's no
   // separate companies table, and only companies with a live conversation
   // are worth offering as an inbox filter.
@@ -163,9 +222,19 @@ export function ConversationList({
 
     if (filter === "unread") {
       result = result.filter((c) => c.unread_count > 0);
+    } else if (filter === "unanswered") {
+      result = result.filter((c) => !!c.awaiting_response_since);
     } else if (filter !== "all") {
       result = result.filter((c) => c.status === filter);
     }
+
+    result = result.filter((c) =>
+      matchesInboxScope(c, {
+        branchId: selectedBranchId,
+        whatsappConfigId: selectedConfigId,
+        unansweredOnly: false,
+      }),
+    );
 
     // Contact-based filters (tags via OR logic, exact company match).
     if (selectedTagIds.length > 0 || selectedCompany !== null) {
@@ -188,7 +257,15 @@ export function ConversationList({
     }
 
     return result;
-  }, [conversations, filter, search, selectedTagIds, selectedCompany]);
+  }, [
+    conversations,
+    filter,
+    search,
+    selectedTagIds,
+    selectedCompany,
+    selectedBranchId,
+    selectedConfigId,
+  ]);
 
   const toggleTag = useCallback((id: string) => {
     setSelectedTagIds((prev) =>
@@ -262,6 +339,108 @@ export function ConversationList({
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          {branches.length > 1 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex max-w-36 items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  selectedBranchId
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <span className="truncate">
+                  {selectedBranchId
+                    ? (branches.find((b) => b.id === selectedBranchId)?.name ??
+                      t("allBranches"))
+                    : t("allBranches")}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-64 w-56 border-border bg-popover"
+              >
+                <DropdownMenuItem
+                  onClick={() => setSelectedBranchId(null)}
+                  className={cn(
+                    "text-sm",
+                    selectedBranchId === null
+                      ? "text-primary"
+                      : "text-popover-foreground",
+                  )}
+                >
+                  {t("allBranches")}
+                </DropdownMenuItem>
+                {branches.map((b) => (
+                  <DropdownMenuItem
+                    key={b.id}
+                    onClick={() => setSelectedBranchId(b.id)}
+                    className={cn(
+                      "text-sm",
+                      selectedBranchId === b.id
+                        ? "text-primary"
+                        : "text-popover-foreground",
+                    )}
+                  >
+                    <span className="truncate">{b.name}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
+          {numbers.length > 1 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex max-w-36 items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  selectedConfigId
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <span className="truncate">
+                  {selectedConfigId
+                    ? (numbers.find((n) => n.id === selectedConfigId)?.label ??
+                      t("allNumbers"))
+                    : t("allNumbers")}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-64 w-56 border-border bg-popover"
+              >
+                <DropdownMenuItem
+                  onClick={() => setSelectedConfigId(null)}
+                  className={cn(
+                    "text-sm",
+                    selectedConfigId === null
+                      ? "text-primary"
+                      : "text-popover-foreground",
+                  )}
+                >
+                  {t("allNumbers")}
+                </DropdownMenuItem>
+                {numbers.map((n) => (
+                  <DropdownMenuItem
+                    key={n.id}
+                    onClick={() => setSelectedConfigId(n.id)}
+                    className={cn(
+                      "text-sm",
+                      selectedConfigId === n.id
+                        ? "text-primary"
+                        : "text-popover-foreground",
+                    )}
+                  >
+                    <span className="truncate">{n.label}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
           {tags.length > 0 && (
             <DropdownMenu>
@@ -439,6 +618,7 @@ function ConversationItem({
   const contact = conversation.contact;
   const displayName = contact?.name || contact?.phone || t("unknown");
   const initials = displayName.charAt(0).toUpperCase();
+  const badge = conversationInboxBadge(conversation);
 
   const handleClick = useCallback(() => {
     onSelect(conversation);
@@ -498,6 +678,11 @@ function ConversationItem({
             />
           </div>
         </div>
+        {badge.number || badge.branch ? (
+          <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+            {[badge.number, badge.branch].filter(Boolean).join(" · ")}
+          </p>
+        ) : null}
       </div>
     </button>
   );
